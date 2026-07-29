@@ -90,13 +90,23 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        dp_rank: int = 0,
+        dp_size: int = 1,
+        shm_name: Optional[str] = None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.allocator = get_allocator_from_storage(
+            allocator_type,
+            shm_name=shm_name,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+        )
         self.can_use_write_back_jit = False
 
         self.dtype = device_pool.store_dtype
@@ -110,6 +120,12 @@ class HostKVCache(abc.ABC):
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+
+        # Partition this rank's free-slot window: each DP rank owns an equal
+        # slice of the pool pages.  local_size is always a multiple of page_size.
+        local_pages = self.page_num // dp_size
+        self.local_size = local_pages * self.page_size
+        self.slot_start = dp_rank * self.local_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -264,10 +280,15 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
+        # mem_state and slot_used span the full pool so cross-DP double-free is detectable.
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.free_slots = torch.arange(
+            self.slot_start,
+            self.slot_start + self.local_size,
+            dtype=torch.int64,
+        )
         # Keep freed chunks aside and consume them lazily from alloc() to avoid
         # concatenating a large free-list on every host-pool free.
         self.release_slots = []

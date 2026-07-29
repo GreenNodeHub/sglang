@@ -1,11 +1,13 @@
 import ctypes
 import ctypes.util
+import fcntl
 import logging
 import math
 import mmap
 import os
 import uuid
 import weakref
+from typing import Optional
 
 import torch
 
@@ -34,7 +36,9 @@ except OSError:
     _libc = None
 
 # MAP_POPULATE is in Python's mmap module only since 3.11.
-_MAP_POPULATE = getattr(mmap, "MAP_POPULATE", 0x08000)
+# Fall back to 0 (not the Linux constant 0x08000) so macOS and other
+# non-Linux platforms don't accidentally use MAP_NOCACHE (same bits).
+_MAP_POPULATE = getattr(mmap, "MAP_POPULATE", 0)
 # MAP_HUGETLB and MAP_HUGE_* are Linux-specific and not in Python's mmap module.
 _MAP_HUGETLB = 0x40000
 _MAP_HUGE_2MB = 21 << 26  # 0x1400000
@@ -136,28 +140,22 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
-def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
-    """Allocate a host tensor via shared memory (/dev/shm).
+def _named_shm_dir() -> str:
+    """Return a directory suitable for named shared-memory files."""
+    if os.path.isdir("/dev/shm"):
+        return "/dev/shm"
+    import tempfile
 
-    Returns a tuple of (tensor, fd, mm).
-    The caller is responsible for keeping the fd open if they need to share it,
-    and closing it when they are done.
+    return tempfile.gettempdir()
+
+
+def _open_anonymous_shm_fd(alloc_bytes: int) -> int:
+    """Open a private anonymous SHM fd and truncate it to alloc_bytes.
+
+    Uses memfd_create when available (Linux 3.17+); falls back to an
+    immediately-unlinked file under /dev/shm.  The resulting fd is not
+    visible to other processes.
     """
-    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
-    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
-
-    # Note: hugepages are not directly supported with /dev/shm mmap files
-    # without mounting hugetlbfs there, so we fall back to plain page size.
-    if hugepage_size != "":
-        logger.warning(
-            "Hugepages are not supported with SHM allocator. "
-            "Falling back to plain page-size mmap."
-        )
-
-    page_size = mmap.PAGESIZE
-    alloc_bytes = math.ceil(n_bytes / page_size) * page_size
-
-    # Create an anonymous shared memory file descriptor via memfd_create
     fd = None
     try:
         # MFD_CLOEXEC is standard on Linux 3.17+
@@ -176,9 +174,91 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
                 pass
         except Exception as e:
             raise OSError(f"Failed to create shm file: {e}")
+    os.ftruncate(fd, alloc_bytes)
+    return fd
+
+
+def _open_named_shm_fd(alloc_bytes: int, shm_name: str) -> int:
+    """Open or create a named SHM file under /dev/shm, serialised with flock.
+
+    The first caller creates the file and truncates it to alloc_bytes; later
+    callers simply open the existing file.  A stale file (wrong size) is
+    removed and recreated.  The file is NOT unlinked on close — the caller
+    owns lifecycle and cleanup.
+    """
+    shm_dir = _named_shm_dir()
+    shm_path = os.path.join(shm_dir, f"{shm_name}.mmap")
+    lock_path = shm_path + ".lock"
+
+    # Serialise creation so only one process truncates.
+    lock_fd = open(lock_path, "a+b")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        is_new = not os.path.exists(shm_path)
+        if not is_new and os.path.getsize(shm_path) != alloc_bytes:
+            logger.warning(
+                "alloc_shm: stale named SHM %s (size %d != expected %d), recreating.",
+                shm_path,
+                os.path.getsize(shm_path),
+                alloc_bytes,
+            )
+            os.remove(shm_path)
+            is_new = True
+
+        fd = os.open(shm_path, os.O_CREAT | os.O_RDWR, 0o600)
+        if is_new:
+            os.ftruncate(fd, alloc_bytes)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+    logger.info(
+        "alloc_shm: %s named SHM %s (%.1f MB)",
+        "created" if is_new else "attached to",
+        shm_path,
+        alloc_bytes / (1024**2),
+    )
+    return fd
+
+
+def alloc_shm(
+    dims: tuple,
+    dtype: torch.dtype,
+    shm_name: Optional[str] = None,
+) -> tuple[torch.Tensor, int, mmap.mmap]:
+    """Allocate a host tensor via shared memory.
+
+    shm_name=None (default)
+        Anonymous private mapping (memfd_create + random name, or an
+        immediately-unlinked /dev/shm file).  Not shareable across
+        unrelated processes.  Preserves the original behaviour.
+
+    shm_name=<str>
+        Named mapping at /dev/shm/<shm_name>.mmap.  All processes that
+        call alloc_shm with the same shm_name and dims/dtype attach to
+        the same physical pages.  The first caller creates and truncates
+        the file; subsequent callers map the existing file.  The file is
+        NOT unlinked on close — the caller owns cleanup.
+
+    Returns (tensor, fd, mm).  The caller must keep fd open for the
+    lifetime of the mapping.
+    """
+    if (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip() != "":
+        logger.warning(
+            "Hugepages are not supported with SHM allocator. "
+            "Falling back to plain page-size mmap."
+        )
+
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+
+    fd = (
+        _open_anonymous_shm_fd(alloc_bytes)
+        if shm_name is None
+        else _open_named_shm_fd(alloc_bytes, shm_name)
+    )
 
     try:
-        os.ftruncate(fd, alloc_bytes)
         mm = mmap.mmap(
             fd,
             alloc_bytes,
@@ -193,8 +273,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
             # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
             pass
     except Exception as e:
-        if fd is not None:
-            os.close(fd)
+        os.close(fd)
         raise e
 
     tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)

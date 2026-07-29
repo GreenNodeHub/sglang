@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import defaultdict
+from typing import Optional
 
 import torch
 
@@ -28,10 +29,30 @@ class HostTensorAllocator:
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
-    def __init__(self):
+    """Host-tensor allocator backed by shared memory.
+
+    shm_name=None  (default / "shm" backend)
+        Anonymous private SHM per process — original behaviour, no
+        cross-process sharing.
+
+    shm_name=<str>  ("shm_shared_l2" backend)
+        Named SHM at /dev/shm/<shm_name>.mmap shared across all DP
+        instances that supply the same name.  dp_rank / dp_size are
+        stored for the slot-partitioning step (step 3).
+    """
+
+    def __init__(
+        self,
+        shm_name: Optional[str] = None,
+        dp_rank: int = 0,
+        dp_size: int = 1,
+    ):
         super().__init__()
-        self.fds = []
-        self.mms = []
+        self.shm_name = shm_name
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.fds: list[int] = []
+        self.mms: list = []
 
     @property
     def fd(self):
@@ -49,7 +70,7 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         self.dims = dims
         from sglang.srt.mem_cache.storage.mmap import alloc_shm
 
-        tensor, fd, mm = alloc_shm(dims, dtype)
+        tensor, fd, mm = alloc_shm(dims, dtype, shm_name=self.shm_name)
         self.fds.append(fd)
         self.mms.append(mm)
         return tensor
@@ -62,9 +83,27 @@ class ShmHostTensorAllocator(HostTensorAllocator):
                 except OSError:
                     pass
         self.fds = []
+        # Named SHM files are intentionally NOT unlinked here: peer DP
+        # instances may still have them mapped.  Stale-file detection in
+        # alloc_shm handles the next-startup cleanup automatically.
 
 
-def get_allocator_from_storage(allocator_type):
+def get_allocator_from_storage(
+    allocator_type: str,
+    *,
+    shm_name: Optional[str] = None,
+    dp_rank: int = 0,
+    dp_size: int = 1,
+) -> HostTensorAllocator:
+    """Return a HostTensorAllocator for the given backend type.
+
+    Extra keyword arguments are forwarded only to allocators that use them:
+
+    shm_name  -- deterministic SHM file name for the "shm_shared_l2" allocator;
+                 must be identical across all DP ranks that should share L2.
+    dp_rank   -- this instance's DP rank (0-based); used for slot partitioning.
+    dp_size   -- total number of DP ranks sharing the pool.
+    """
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -95,6 +134,12 @@ def get_allocator_from_storage(allocator_type):
             return HostTensorAllocator()
     elif allocator_type == "shm":
         return ShmHostTensorAllocator()
+    elif allocator_type == "shm_shared_l2":
+        return ShmHostTensorAllocator(
+            shm_name=shm_name,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+        )
     else:
         return HostTensorAllocator()
 
@@ -103,6 +148,11 @@ def get_allocator_type(server_args) -> str:
     backend = getattr(server_args, "hicache_storage_backend", None)
     if backend == "shm":
         return "shm"
+    if backend == "shm_cross_dp":
+        # Cross-DP L3 sharing implies we also want a shared L2 pool so
+        # that write-through pages are readable by peer DP instances
+        # directly from host memory without going through L3 at all.
+        return "shm_shared_l2"
     if backend == "dynamic":
         extra_config_str = getattr(
             server_args, "hicache_storage_backend_extra_config", None
@@ -112,6 +162,8 @@ def get_allocator_type(server_args) -> str:
                 config = json.loads(extra_config_str)
                 if config.get("allocator") == "shm":
                     return "shm"
+                if config.get("allocator") == "shm_shared_l2":
+                    return "shm_shared_l2"
             except Exception:
                 pass
     return backend or "default"

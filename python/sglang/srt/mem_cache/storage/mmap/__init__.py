@@ -3,9 +3,16 @@
 
 """Mmap allocator storage backend helpers for SGLang HiCache."""
 
-from .mmap_allocator import alloc_mmap, alloc_shm
+from .mmap_allocator import (
+    alloc_mmap,
+    alloc_shm,
+    _named_shm_dir,
+    _open_named_shm_fd,
+)
 
 __all__ = [
     "alloc_mmap",
     "alloc_shm",
+    "_named_shm_dir",
+    "_open_named_shm_fd",
 ]

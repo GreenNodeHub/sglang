@@ -495,7 +495,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori", "shm_peer_l2"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))

@@ -39,6 +39,9 @@ class CacheInitParams:
     pp_rank: int = 0
     pp_size: int = 1
 
+    dp_rank: int = 0
+    dp_size: int = 1
+
     attn_cp_rank: int = 0
     attn_cp_size: int = 1
 

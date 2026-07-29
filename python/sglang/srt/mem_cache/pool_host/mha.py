@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import Optional
 
 import psutil
 import torch
@@ -79,6 +80,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        dp_rank: int = 0,
+        dp_size: int = 1,
+        shm_name: Optional[str] = None,
     ):
         super().__init__(
             device_pool,
@@ -89,6 +93,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            shm_name=shm_name,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only

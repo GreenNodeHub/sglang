@@ -189,6 +189,10 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "shm_cross_dp":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "shm_peer_l2":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -244,4 +248,16 @@ StorageBackendFactory.register_backend(
     "shm",
     "sglang.srt.mem_cache.storage.shm",
     "HiCacheShm",
+)
+
+StorageBackendFactory.register_backend(
+    "shm_cross_dp",
+    "sglang.srt.mem_cache.storage.shm.hicache_shm_cross_dp",
+    "HiCacheShmCrossDP",
+)
+
+StorageBackendFactory.register_backend(
+    "shm_peer_l2",
+    "sglang.srt.mem_cache.storage.shm.hicache_shm_peer_l2",
+    "HiCacheShmPeerL2",
 )

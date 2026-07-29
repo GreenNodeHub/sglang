@@ -83,6 +83,19 @@ class HiRadixCache(RadixCache):
 
         allocator_type = get_allocator_type(server_args)
 
+        # Build shared L2 SHM name when the allocator needs cross-DP sharing.
+        # The name must be identical across all DP ranks: it includes model and
+        # PP config but NOT dp_rank, so every DP process maps the same file.
+        shm_name: Optional[str] = None
+        if allocator_type == "shm_shared_l2":
+            model_slug = "-".join(
+                (server_args.served_model_name or "").split("/")
+            )
+            shm_name = f"sglang_l2_{model_slug}_pp{params.pp_rank}_{params.pp_size}"
+
+        dp_rank = params.dp_rank
+        dp_size = params.dp_size
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
@@ -91,6 +104,9 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=allocator_type,
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                shm_name=shm_name,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
