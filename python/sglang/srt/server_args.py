@@ -2613,6 +2613,8 @@ class ServerArgs:
                 "simm",
                 "mori",
                 "shm",
+                "shm_cross_dp",
+                "shm_peer_l2",
             ],
         ),
         NS("memory"),

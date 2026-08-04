@@ -148,10 +148,10 @@ def get_allocator_type(server_args) -> str:
     backend = getattr(server_args, "hicache_storage_backend", None)
     if backend == "shm":
         return "shm"
-    if backend == "shm_cross_dp":
-        # Cross-DP L3 sharing implies we also want a shared L2 pool so
-        # that write-through pages are readable by peer DP instances
-        # directly from host memory without going through L3 at all.
+    if backend in ("shm_cross_dp", "shm_peer_l2"):
+        # Both cross-DP backends require a shared L2 pool so peer DP ranks
+        # map the same physical SHM pages and can read each other's KV data
+        # without going through a separate L3 store.
         return "shm_shared_l2"
     if backend == "dynamic":
         extra_config_str = getattr(

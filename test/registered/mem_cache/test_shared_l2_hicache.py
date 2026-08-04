@@ -318,6 +318,21 @@ class TestShmAllocatorFactory(CustomTestCase):
 
         self.assertEqual(get_allocator_type(_Args()), "shm_shared_l2")
 
+    def test_shm_peer_l2_maps_to_shm_shared_l2(self):
+        """'shm_peer_l2' storage backend maps to 'shm_shared_l2' allocator type.
+
+        Guards the wiring between --hicache-storage-backend shm_peer_l2 and
+        the shared L2 allocator. Without this mapping, both DP ranks get
+        separate private mmap regions — batch_get_v1 reads from the wrong
+        buffer and silently returns stale data.
+        """
+
+        class _Args:
+            hicache_storage_backend = "shm_peer_l2"
+            hicache_storage_backend_extra_config = None
+
+        self.assertEqual(get_allocator_type(_Args()), "shm_shared_l2")
+
     def test_shm_backend_stays_shm(self):
         """'shm' backend must NOT be silently upgraded to 'shm_shared_l2'."""
 
