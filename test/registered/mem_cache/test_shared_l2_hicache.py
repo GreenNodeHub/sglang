@@ -493,6 +493,29 @@ class TestHiCacheShmPeerL2(CustomTestCase):
         self.assertEqual(b._capacity, user_capacity)
         self.assertTrue(b._capacity_user_set)
 
+    def test_collision_detected_and_counted(self):
+        """Writing two distinct keys into a capacity-1 table must record a collision.
+
+        Guards the collision counter path: if _entry_hash64 check or the
+        counter increment is removed, _collision_count stays 0 even when the
+        index silently overwrites an existing entry.
+        """
+        import dataclasses
+
+        cfg = dataclasses.replace(
+            self._cfg,
+            extra_config={"peer_l2_capacity": 1},
+        )
+        b = HiCacheShmPeerL2(cfg)
+        b.register_mem_pool_host(
+            _FlatBufPool(self._buf, dp_rank=0, page_size=self._PAGE_SIZE)
+        )
+        b.batch_set_v1(["key_first"], self._host_idx(0))
+        self.assertEqual(b._collision_count, 0)  # first write: slot was empty
+
+        b.batch_set_v1(["key_second"], self._host_idx(2))
+        self.assertEqual(b._collision_count, 1)  # second write: different key, same slot
+
     def test_index_shm_is_created_after_registration(self):
         b0, _ = self._make_backends()
         self.assertIsNotNone(b0._mm)

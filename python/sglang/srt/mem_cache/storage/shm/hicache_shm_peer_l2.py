@@ -76,6 +76,7 @@ _E_KEYLEN = 24    # uint16 LE
 _E_KEYSTR = 32    # uint8[256]
 
 _DEFAULT_CAPACITY = 4096
+_COLLISION_LOG_INTERVAL = 10_000  # log collision stats every N writes
 
 
 def _low64(key: str) -> int:
@@ -139,6 +140,10 @@ class HiCacheShmPeerL2(HiCacheStorage):
         self._write_mutex = threading.Lock()
         self._entries: Optional[np.ndarray] = None  # (capacity, ENTRY_SIZE) uint8
         self.registered_pools: dict = {}
+
+        # Collision tracking — local to this process, not cross-rank.
+        self._write_count: int = 0
+        self._collision_count: int = 0
 
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
@@ -309,7 +314,14 @@ class HiCacheShmPeerL2(HiCacheStorage):
                 for i, key in enumerate(keys):
                     try:
                         slot_start = int(host_indices[i * self._page_size].item())
-                        idx_slot = _low64(key) % self._capacity
+                        h = _low64(key)
+                        idx_slot = h % self._capacity
+                        self._write_count += 1
+                        if (
+                            self._entry_valid(idx_slot)
+                            and self._entry_hash64(idx_slot) != h
+                        ):
+                            self._collision_count += 1
                         self._write_entry(idx_slot, key, self._dp_rank, slot_start)
                         results.append(True)
                     except Exception as e:
@@ -319,7 +331,30 @@ class HiCacheShmPeerL2(HiCacheStorage):
                         results.append(False)
             finally:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        self._maybe_log_collision_stats()
         return results
+
+    def _maybe_log_collision_stats(self) -> None:
+        if self._write_count == 0 or self._write_count % _COLLISION_LOG_INTERVAL != 0:
+            return
+        rate = self._collision_count / self._write_count
+        if rate > 0.10:
+            logger.warning(
+                "HiCacheShmPeerL2: high index collision rate %.1f%% "
+                "(%d/%d writes) — increase peer_l2_capacity (current=%d) "
+                "to reduce cache misses",
+                rate * 100,
+                self._collision_count,
+                self._write_count,
+                self._capacity,
+            )
+        else:
+            logger.debug(
+                "HiCacheShmPeerL2: collision rate %.1f%% (%d/%d writes)",
+                rate * 100,
+                self._collision_count,
+                self._write_count,
+            )
 
     def batch_get_v1(
         self,
