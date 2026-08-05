@@ -105,11 +105,12 @@ class HiCacheShmPeerL2(HiCacheStorage):
     ):
         self._cfg = storage_config
         self._capacity: int = _DEFAULT_CAPACITY
+        self._capacity_user_set: bool = False
         self._shm_dir: str = "/dev/shm"
         if storage_config.extra_config:
-            self._capacity = int(
-                storage_config.extra_config.get("peer_l2_capacity", _DEFAULT_CAPACITY)
-            )
+            if "peer_l2_capacity" in storage_config.extra_config:
+                self._capacity = int(storage_config.extra_config["peer_l2_capacity"])
+                self._capacity_user_set = True
             self._shm_dir = str(
                 storage_config.extra_config.get("peer_l2_shm_dir", "/dev/shm")
             )
@@ -149,6 +150,20 @@ class HiCacheShmPeerL2(HiCacheStorage):
         self._page_size = mem_pool_host.page_size
         self._dp_rank = mem_pool_host.dp_rank
         self._dp_size = mem_pool_host.dp_size
+        if not self._capacity_user_set:
+            # Auto-compute: all DP ranks write to the same index, so total
+            # active keys ≈ page_num (both partitions combined). ×4 gives a
+            # 25% load factor on the direct-mapped table, keeping collision
+            # rate low without burning too much /dev/shm.
+            self._capacity = mem_pool_host.page_num * 4
+            logger.info(
+                "HiCacheShmPeerL2: auto-computed peer_l2_capacity=%d "
+                "(page_num=%d × 4, index size=%.1f MB); "
+                "override with peer_l2_capacity in --hicache-storage-backend-extra-config",
+                self._capacity,
+                mem_pool_host.page_num,
+                self._capacity * _ENTRY_SIZE / 1024**2,
+            )
         if self._mm is None:
             self._init_shm()
 

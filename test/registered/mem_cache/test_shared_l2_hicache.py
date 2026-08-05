@@ -165,6 +165,8 @@ class _FlatBufPool:
         self.dp_size = 2
         self.page_size = page_size
         self._feat = buf.shape[1] if buf.dim() == 2 else buf.numel() // 32
+        n_tokens = buf.shape[0] if buf.dim() == 2 else buf.numel() // self._feat
+        self.page_num = n_tokens // page_size
 
     def get_data_page(self, idx: int, flat: bool = True) -> torch.Tensor:
         d = self._buf[idx : idx + self.page_size, :]
@@ -459,6 +461,38 @@ class TestHiCacheShmPeerL2(CustomTestCase):
             indices.extend([s] * self._PAGE_SIZE)
         return torch.tensor(indices, dtype=torch.int64)
 
+    def test_capacity_auto_computed_from_page_num(self):
+        """Without peer_l2_capacity in extra_config, capacity = page_num × 4.
+
+        Guards the auto-compute path: if register_mem_pool_host stops setting
+        _capacity from page_num, the default of 4096 silently returns, causing
+        near-100% collision rate on any real L2 pool.
+        """
+        b = HiCacheShmPeerL2(self._cfg)
+        pool = _FlatBufPool(self._buf, dp_rank=0, page_size=self._PAGE_SIZE)
+        b.register_mem_pool_host(pool)
+        self.assertEqual(b._capacity, pool.page_num * 4)
+        self.assertFalse(b._capacity_user_set)
+
+    def test_capacity_user_value_overrides_auto(self):
+        """peer_l2_capacity in extra_config must pin _capacity and set _capacity_user_set.
+
+        Guards the override path: a regression that ignores extra_config would
+        silently replace the user value with the auto-computed one.
+        """
+        import dataclasses
+
+        user_capacity = 512
+        cfg = dataclasses.replace(
+            _make_storage_config(f"model_{self._tag}_override"),
+            extra_config={"peer_l2_capacity": user_capacity},
+        )
+        b = HiCacheShmPeerL2(cfg)
+        pool = _FlatBufPool(self._buf, dp_rank=0, page_size=self._PAGE_SIZE)
+        b.register_mem_pool_host(pool)
+        self.assertEqual(b._capacity, user_capacity)
+        self.assertTrue(b._capacity_user_set)
+
     def test_index_shm_is_created_after_registration(self):
         b0, _ = self._make_backends()
         self.assertIsNotNone(b0._mm)
@@ -581,6 +615,7 @@ cfg = HiCacheStorageConfig(
 
 class Pool:
     page_size = PAGE_SIZE
+    page_num  = N // PAGE_SIZE
     dp_rank   = 0
     dp_size   = 2
     def get_data_page(self, idx, flat=True):
@@ -628,6 +663,7 @@ cfg = HiCacheStorageConfig(
 
 class Pool:
     page_size = PAGE_SIZE
+    page_num  = N // PAGE_SIZE
     dp_rank   = 1
     dp_size   = 2
     def get_data_page(self, idx, flat=True):
