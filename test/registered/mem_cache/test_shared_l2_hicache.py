@@ -445,7 +445,7 @@ class TestHiCacheShmPeerL2(CustomTestCase):
 
     def tearDown(self):
         d = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        _cleanup_shm(d, f"sglang_l2_idx*{self._tag}*")
+        _cleanup_shm(d, f"sglang_l2_idx*{self._tag}*", f"sglang_l2_gen*{self._tag}*")
 
     def _make_backends(self):
         b0 = HiCacheShmPeerL2(self._cfg)
@@ -515,6 +515,43 @@ class TestHiCacheShmPeerL2(CustomTestCase):
 
         b.batch_set_v1(["key_second"], self._host_idx(2))
         self.assertEqual(b._collision_count, 1)  # second write: different key, same slot
+
+    def test_stale_slot_returns_miss_not_wrong_data(self):
+        """After a slot is reallocated, batch_get_v1 must return False (miss), not stale data.
+
+        This is the generation-counter regression guard: without it, Rank B
+        would memcpy whatever bytes happen to be in the reallocated slot and
+        return True, silently loading wrong KV data into the GPU.
+
+        Sequence:
+          1. b0 (Rank A) writes key_A → slot 0, gen=0 recorded in index entry
+          2. b0 simulates slot reuse via _alloc_callback → gen_arr[0] becomes 1
+          3. b1 (Rank B) reads key_A → index still shows slot 0 but gen mismatch
+             (index says 0, gen_arr says 1) → must return False
+        """
+        b0, b1 = self._make_backends()
+        b0.batch_set_v1(["key_A"], self._host_idx(0))
+
+        # Verify b1 can read before reuse
+        ok_before = b1.batch_get_v1(["key_A"], self._host_idx(self._N_TOKENS // 2))
+        self.assertTrue(ok_before[0], "Rank B should hit before slot is reallocated")
+
+        # Simulate Rank A reallocating slot 0 (the _alloc_callback increments gen)
+        b0._alloc_callback(torch.tensor([0] * self._PAGE_SIZE, dtype=torch.int64))
+
+        # Now Rank B must see a miss, not stale data
+        ok_after = b1.batch_get_v1(["key_A"], self._host_idx(self._N_TOKENS // 2))
+        self.assertFalse(ok_after[0], "Rank B must miss after slot is reallocated (gen mismatch)")
+
+    def test_gen_array_shm_created_after_registration(self):
+        """Gen array SHM must be initialized when a pool is registered.
+
+        Guards that _init_gen_shm is called from register_mem_pool_host;
+        if removed, _gen_arr stays None and generation checks are silently skipped.
+        """
+        b0, _ = self._make_backends()
+        self.assertIsNotNone(b0._gen_arr)
+        self.assertIsNotNone(b0._gen_mm)
 
     def test_index_shm_is_created_after_registration(self):
         b0, _ = self._make_backends()

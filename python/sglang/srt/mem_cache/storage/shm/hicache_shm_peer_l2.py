@@ -62,18 +62,21 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 logger = logging.getLogger(__name__)
 
-_MAGIC = 0xCA_FE_FEED_0001
+_MAGIC = 0xCA_FE_FEED_0002  # bumped from 0001 when _E_GEN field was added
 _HEADER_SIZE = 256
 _ENTRY_SIZE = 288
 _MAX_KEY_LEN = 256
 
-# Byte offsets within a single index entry
-_E_VALID = 0      # uint8
-_E_DPRANK = 1     # uint8
-_E_SLOT = 8       # uint64 LE   first token index in host pool
-_E_HASH = 16      # uint64 LE   low-8 bytes of SHA-256(key)
-_E_KEYLEN = 24    # uint16 LE
-_E_KEYSTR = 32    # uint8[256]
+# Byte offsets within a single index entry (total 288 bytes)
+_E_VALID  = 0   # uint8
+_E_DPRANK = 1   # uint8
+_E_GEN    = 2   # uint32 LE  generation counter at write time (was pad)
+# offset 6-7: pad (2 bytes)
+_E_SLOT   = 8   # uint64 LE  first token index in host pool
+_E_HASH   = 16  # uint64 LE  low-8 bytes of SHA-256(key)
+_E_KEYLEN = 24  # uint16 LE
+# offset 26-31: pad (6 bytes)
+_E_KEYSTR = 32  # uint8[256]
 
 _DEFAULT_CAPACITY = 4096
 _COLLISION_LOG_INTERVAL = 10_000  # log collision stats every N writes
@@ -141,6 +144,12 @@ class HiCacheShmPeerL2(HiCacheStorage):
         self._entries: Optional[np.ndarray] = None  # (capacity, ENTRY_SIZE) uint8
         self.registered_pools: dict = {}
 
+        # Generation array SHM — tracks slot reuse to detect stale index entries.
+        # _gen_arr[page_idx] is incremented each time that page slot is reallocated.
+        self._gen_mm: Optional[mmap.mmap] = None
+        self._gen_arr: Optional[np.ndarray] = None  # uint32[page_num], in shared memory
+        self._gen_path: Optional[str] = None
+
         # Collision tracking — local to this process, not cross-rank.
         self._write_count: int = 0
         self._collision_count: int = 0
@@ -171,6 +180,9 @@ class HiCacheShmPeerL2(HiCacheStorage):
             )
         if self._mm is None:
             self._init_shm()
+        if self._gen_mm is None:
+            self._init_gen_shm(mem_pool_host.page_num)
+        mem_pool_host.register_alloc_callback(self._alloc_callback)
 
     def _init_shm(self) -> None:
         total_bytes = _HEADER_SIZE + self._capacity * _ENTRY_SIZE
@@ -232,6 +244,72 @@ class HiCacheShmPeerL2(HiCacheStorage):
             offset=_HEADER_SIZE,
         )
 
+    def _init_gen_shm(self, page_num: int) -> None:
+        """Create or attach to the generation-counter SHM array (uint32[page_num])."""
+        self._gen_path = self._idx_path.replace("sglang_l2_idx", "sglang_l2_gen")
+        gen_lock_path = self._gen_path + ".lock"
+        size_bytes = page_num * 4  # one uint32 per page
+
+        gen_lock_fd = open(gen_lock_path, "a+b")
+        fcntl.flock(gen_lock_fd, fcntl.LOCK_EX)
+        try:
+            stale = (
+                os.path.exists(self._gen_path)
+                and os.path.getsize(self._gen_path) != size_bytes
+            )
+            if stale:
+                os.remove(self._gen_path)
+                logger.warning(
+                    "HiCacheShmPeerL2: stale gen array at %s removed", self._gen_path
+                )
+
+            needs_init = not os.path.exists(self._gen_path)
+            fd = os.open(self._gen_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                if needs_init:
+                    os.ftruncate(fd, size_bytes)
+                self._gen_mm = mmap.mmap(fd, size_bytes, access=mmap.ACCESS_WRITE)
+            finally:
+                os.close(fd)
+
+            if needs_init:
+                self._gen_mm[:size_bytes] = b"\x00" * size_bytes
+                self._gen_mm.flush()
+                logger.info(
+                    "HiCacheShmPeerL2: created gen array %s  pages=%d  size=%.1f kB",
+                    self._gen_path,
+                    page_num,
+                    size_bytes / 1024,
+                )
+            else:
+                logger.info(
+                    "HiCacheShmPeerL2: attached to existing gen array %s", self._gen_path
+                )
+        finally:
+            fcntl.flock(gen_lock_fd, fcntl.LOCK_UN)
+            gen_lock_fd.close()
+
+        self._gen_arr = np.ndarray(
+            shape=(page_num,), dtype=np.uint32, buffer=self._gen_mm
+        )
+
+    def _alloc_callback(self, select_index: "torch.Tensor") -> None:
+        """Increment the generation for each reallocated page slot.
+
+        Called by HostKVCache.alloc() just before returning the new indices.
+        Incrementing here (before new data is written) ensures Rank B sees a
+        mismatched generation and treats the slot as a miss instead of reading
+        data from the previous occupant.
+        """
+        if self._gen_arr is None:
+            return
+        page_size = self._page_size
+        # select_index holds token indices; pages start every page_size entries.
+        page_starts = select_index[::page_size].cpu().numpy()
+        page_idxs = page_starts // page_size
+        for idx in page_idxs:
+            self._gen_arr[idx] += 1  # uint32 write to aligned addr is atomic on x86/ARM
+
     # ── index entry helpers ──────────────────────────────────────────────────
 
     def _entry_valid(self, slot: int) -> bool:
@@ -248,6 +326,11 @@ class HiCacheShmPeerL2(HiCacheStorage):
     def _entry_hash64(self, slot: int) -> int:
         return int.from_bytes(
             bytes(self._entries[slot, _E_HASH : _E_HASH + 8]), "little"
+        )
+
+    def _entry_generation(self, slot: int) -> int:
+        return int.from_bytes(
+            bytes(self._entries[slot, _E_GEN : _E_GEN + 4]), "little"
         )
 
     def _entry_key(self, slot: int) -> str:
@@ -271,7 +354,7 @@ class HiCacheShmPeerL2(HiCacheStorage):
         return None
 
     def _write_entry(
-        self, slot: int, key: str, dp_rank: int, slot_idx: int
+        self, slot: int, key: str, dp_rank: int, slot_idx: int, generation: int
     ) -> None:
         """Overwrite one index entry.  Caller must hold write lock."""
         h = _low64(key)
@@ -280,6 +363,9 @@ class HiCacheShmPeerL2(HiCacheStorage):
         row = self._entries[slot]
         row[_E_VALID] = 0  # invalidate first so readers see a clean slot
         row[_E_DPRANK] = dp_rank
+        row[_E_GEN : _E_GEN + 4] = np.frombuffer(
+            generation.to_bytes(4, "little"), dtype=np.uint8
+        )
         row[_E_SLOT : _E_SLOT + 8] = np.frombuffer(
             slot_idx.to_bytes(8, "little"), dtype=np.uint8
         )
@@ -322,7 +408,9 @@ class HiCacheShmPeerL2(HiCacheStorage):
                             and self._entry_hash64(idx_slot) != h
                         ):
                             self._collision_count += 1
-                        self._write_entry(idx_slot, key, self._dp_rank, slot_start)
+                        page_idx = slot_start // self._page_size
+                        gen = int(self._gen_arr[page_idx]) if self._gen_arr is not None else 0
+                        self._write_entry(idx_slot, key, self._dp_rank, slot_start, gen)
                         results.append(True)
                     except Exception as e:
                         logger.warning(
@@ -376,6 +464,10 @@ class HiCacheShmPeerL2(HiCacheStorage):
         pool = self.mem_pool_host
 
         # Phase 1: read all peer slot indices under a single shared lock.
+        # For each hit, also verify the generation counter matches: if the peer
+        # has reallocated that L2 slot since the index was written, the stored
+        # generation will differ from the current one in the gen array, and we
+        # treat the entry as a miss rather than copying stale data.
         peer_slots: List[Optional[int]] = []
         fcntl.flock(self._lock_fd, fcntl.LOCK_SH)
         try:
@@ -383,8 +475,15 @@ class HiCacheShmPeerL2(HiCacheStorage):
                 idx_slot = self._find(key)
                 if idx_slot is None or self._entry_dp_rank(idx_slot) == self._dp_rank:
                     peer_slots.append(None)
-                else:
-                    peer_slots.append(self._entry_slot_idx(idx_slot))
+                    continue
+                peer_slot = self._entry_slot_idx(idx_slot)
+                if self._gen_arr is not None:
+                    stored_gen = self._entry_generation(idx_slot)
+                    current_gen = int(self._gen_arr[peer_slot // self._page_size])
+                    if stored_gen != current_gen:
+                        peer_slots.append(None)  # slot was reused — stale entry
+                        continue
+                peer_slots.append(peer_slot)
         finally:
             fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
 

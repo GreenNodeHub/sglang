@@ -159,6 +159,9 @@ class HostKVCache(abc.ABC):
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        # Callbacks fired with the allocated token-index tensor just before alloc()
+        # returns.  Used by observers (e.g. HiCacheShmPeerL2) to track slot reuse.
+        self._alloc_callbacks: list = []
         self.clear()
 
     def destroy(self):
@@ -332,7 +335,14 @@ class HostKVCache(abc.ABC):
         )
         self.slot_used[select_index] = True
 
+        for cb in self._alloc_callbacks:
+            cb(select_index)
+
         return select_index
+
+    def register_alloc_callback(self, cb) -> None:
+        """Register a callback invoked with the allocated token-index tensor on every alloc()."""
+        self._alloc_callbacks.append(cb)
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
