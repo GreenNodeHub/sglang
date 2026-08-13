@@ -1,4 +1,4 @@
-# HiCache `shm_peer_l2` — Cross-DP Shared L2 Cache
+# HiCache `shm_peer_l2` — Cross-DP Peer L2 Cache
 
 ## Tổng quan
 
@@ -6,34 +6,36 @@
 
 ```
 Không dùng shm_peer_l2:
-  Rank A: [L1 GPU] → [L2 mmap A]   ← private, Rank B không thấy
-  Rank B: [L1 GPU] → [L2 mmap B]   ← private, phải recompute prefix
+  Rank A: [GPU L1] → [L2 buffer A]  ← private, Rank B không thấy
+  Rank B: [GPU L1] → [L2 buffer B]  ← phải recompute prefix
 
 Dùng shm_peer_l2:
-  Rank A: [L1 GPU] → [shared L2 SHM] ← cùng physical pages
-  Rank B: [L1 GPU] ←─ memcpy ─────── [shared L2 SHM][slot của Rank A]
-                        ↑ không cần recompute
+  Rank A: [GPU L1] → [shared L2 SHM buffer]
+  Rank B: [GPU L1] ←── memcpy ──── [shared L2 SHM buffer][slot của Rank A]
+                         ↑ không cần recompute
 ```
 
 ### So sánh với `shm_cross_dp`
 
 | | `shm_cross_dp` | `shm_peer_l2` |
 |---|---|---|
-| L2 buffer | Private per rank | Shared physical pages |
-| L3 data store | SHM file chứa full page data | Không có |
-| Write path | GPU → L2 → copy vào SHM L3 | GPU → SHM L2 → ghi 288B pointer |
+| L2 buffer | Shared physical pages | Shared physical pages |
+| L3 data store | SHM file chứa full page data (copy thêm 1 lần) | Không có |
+| Write path | GPU → L2 → copy vào SHM L3 file | GPU → SHM L2 → ghi 288B pointer |
 | Read path | SHM L3 → CPU buf → L2 → GPU | memcpy trong SHM → GPU |
-| Memory dùng | L2_A + L2_B + SHM_data ≈ 3× | Shared L2 + tiny index ≈ 1× |
+| Memory dùng | shared L2 + SHM data copy | shared L2 + tiny index (~vài chục MB) |
 | Interface | v0 (`batch_set` / `batch_get`) | v1 (`batch_set_v1` / `batch_get_v1`) |
+
+Cả hai đều dùng chung `shm_shared_l2` allocator cho L2 buffer. `shm_peer_l2` không cần khai báo `shm_cross_dp` riêng — chỉ cần một flag là đủ.
 
 ---
 
 ## Điều kiện tiên quyết
 
-- `dp_size >= 2`
-- Tất cả DP rank chạy trên **cùng một node** (`/dev/shm` là local memory)
-- `/dev/shm` đủ dung lượng: L2 SHM buffer + index file
-- `--hicache-write-policy write_through` (bắt buộc — `write_back` không flush L2 ngay, Rank B sẽ không thấy)
+- `--dp-size >= 2`
+- Tất cả DP rank chạy trên **cùng node** — `/dev/shm` là tmpfs node-local; backend này không hoạt động cross-node
+- `/dev/shm` đủ dung lượng: L2 SHM buffer + index + gen array (xem tính toán bên dưới)
+- `--hicache-write-policy write_through` — `write_back` chỉ flush L2 khi evict khỏi L1, nên Rank B sẽ không thấy data kịp thời
 
 ---
 
@@ -48,28 +50,35 @@ python -m sglang.launch_server \
     --hicache-write-policy write_through \
     --hicache-io-backend kernel \
     --hicache-mem-layout page_first \
-    --hicache-storage-backend shm_peer_l2 \
-    --hicache-storage-backend-extra-config '{"peer_l2_capacity": <capacity>}'
+    --hicache-storage-backend shm_peer_l2
 ```
 
-Trên H200 với CUDA 12.8+ (`cudaMemcpyBatchAsync` available):
+**H200 / CUDA 12.8+ có `cudaMemcpyBatchAsync`:**
 
 ```bash
     --hicache-io-backend direct \
     --hicache-mem-layout page_first_direct \
 ```
 
+**Tuỳ chỉnh index capacity và thư mục SHM:**
+
+```bash
+    --hicache-storage-backend-extra-config '{"peer_l2_capacity": 262144, "peer_l2_shm_dir": "/dev/shm"}'
+```
+
+> Nếu bỏ qua `peer_l2_capacity`, server tự tính theo `page_num × 4` (load factor 25%) và ghi log tại startup.
+
 ---
 
 ## Tính `peer_l2_capacity`
 
-`peer_l2_capacity` là số entry của index hash table (direct-mapped). Quá nhỏ → collision → entry cũ bị overwrite → index miss dù data vẫn còn trong L2.
+Index là direct-mapped hash table: mỗi key chiếm đúng 1 slot (288 byte). Quá nhỏ → collision → entry cũ bị overwrite → index miss dù data vẫn còn trong L2.
 
 ### Công thức
 
 ```
-# MHA model (GQA/MHA):
-size_per_token  = head_dim × num_kv_heads × num_layers × dtype_bytes × 2
+# MHA / GQA model:
+size_per_token  = head_dim × num_kv_heads × num_layers × dtype_bytes × 2  (K+V)
 
 # MLA model (DeepSeek):
 size_per_token  = (kv_lora_rank + qk_rope_head_dim) × dtype_bytes × num_layers
@@ -81,13 +90,13 @@ page_num        = hicache_size_GB × 1e9 / page_size_bytes
 peer_l2_capacity = page_num × load_factor_inv
 ```
 
-**`load_factor_inv`**:
+**`load_factor_inv`:**
 
 | Giá trị | Load factor | Khi nào dùng |
 |---|---|---|
-| 2 | 50% | RAM tight, chấp nhận miss cao |
-| 4 | 25% | **Recommended** cho production |
-| 8 | 12.5% | Prefix dài, cần hit rate cao |
+| 2 | 50% | RAM tight |
+| 4 | 25% | **Recommended** — mặc định tự tính |
+| 8 | 12.5% | Prefix rất dài, cần hit rate tối đa |
 
 ### Script tính nhanh
 
@@ -106,19 +115,24 @@ def calc_peer_l2_capacity(
     page_num        = int(hicache_size_gb * 1e9 / page_size_bytes)
     capacity        = page_num * load_factor_inv
     index_mb        = capacity * 288 / 1024**2
+    gen_mb          = page_num * 4 / 1024**2
     print(f"page_size       : {page_size_bytes / 1024**2:.2f} MB")
     print(f"page_num        : {page_num:,}")
-    print(f"peer_l2_capacity: {capacity:,}")
+    print(f"peer_l2_capacity: {capacity:,}  →  round up to next power of 2: {2 ** (capacity - 1).bit_length():,}")
     print(f"index file size : {index_mb:.1f} MB")
+    print(f"gen array size  : {gen_mb:.2f} MB")
+    print(f"/dev/shm usage  : L2_buffer + {index_mb + gen_mb:.1f} MB overhead")
 ```
 
-Ví dụ — GLM 70B, bf16, L2=475GB:
+Ví dụ — Llama 70B (GQA 8 heads), bf16, L2=475 GB:
 
 ```
 page_size       : 10.00 MB
 page_num        : 47,683
-peer_l2_capacity: 190,732  →  làm tròn lên 2^18 = 262144
-index file size : 52.5 MB
+peer_l2_capacity: 190,732  →  262,144 (2^18)
+index file size : 54.8 MB
+gen array size  : 0.18 MB
+/dev/shm usage  : 475 GB + ~55 MB overhead
 ```
 
 ---
@@ -127,17 +141,21 @@ index file size : 52.5 MB
 
 ```
 /dev/shm/
-├── sglang_l2_<model>_pp<rank>_<size>.mmap       # L2 buffer (shared physical pages)
-├── sglang_l2_<model>_pp<rank>_<size>.mmap.lock  # flock serialize creation
-├── sglang_l2_idx_<model>_pp<rank>_<size>.bin    # index hash table (288B/entry)
-└── sglang_l2_idx_<model>_pp<rank>_<size>.bin.lock
+├── sglang_l2_<model_slug>_pp<pp_rank>_<pp_size>.mmap       # L2 buffer (shared vật lý)
+├── sglang_l2_<model_slug>_pp<pp_rank>_<pp_size>.mmap.lock  # flock serialize creation
+├── sglang_l2_idx_<model_slug>_pp<pp_rank>_<pp_size>.bin    # index hash table (288B/entry)
+├── sglang_l2_idx_<model_slug>_pp<pp_rank>_<pp_size>.bin.lock
+├── sglang_l2_gen_<model_slug>_pp<pp_rank>_<pp_size>.bin    # generation counter (4B/page)
+└── sglang_l2_gen_<model_slug>_pp<pp_rank>_<pp_size>.bin.lock
 ```
+
+`<model_slug>` = model path với `/` thay bằng `-`, ví dụ: `deepseek-ai-DeepSeek-V3`.
 
 Kiểm tra sau khi start:
 
 ```bash
-# Phải là 1 file .mmap dùng chung, không phải 2 file riêng
-ls -lh /dev/shm/sglang_l2_*.mmap
+# Phải có 1 file .mmap lớn (L2 buffer) + 2 file .bin nhỏ (index + gen)
+ls -lh /dev/shm/sglang_l2*
 
 # Kiểm tra dung lượng SHM còn trống
 df -h /dev/shm
@@ -147,33 +165,37 @@ df -h /dev/shm
 
 ## Luồng hoạt động
 
-### Request 1 → Rank A (cache miss)
+### Request 1 → Rank A (cache miss, compute và ghi L2)
 
 ```
 Rank A: match_prefix() → L1 MISS
-      → prefetch_from_storage() → batch_exists() → index MISS
-      → GPU compute prefix
-      → KV → L1 (device HBM)
-      → _inc_hit_count() → hit_count >= write_through_threshold (=1)
-      → write_backup(): GPU→CPU DMA → shared L2 SHM slot [Rank A partition]
+      → prefetch_from_storage() → index MISS
+      → GPU compute prefix tokens
+      → write_backup(): GPU→CPU DMA → shared L2 SHM [slot thuộc partition của Rank A]
       → backup_thread: batch_set_v1()
-          → _write_entry(idx_slot, key, dp_rank=A, slot_start)   ← 288B vào index SHM
+          → _write_entry(key, dp_rank=A, slot_start)   ← 288B vào index SHM
 ```
 
-### Request 2 → Rank B (cùng prefix)
+### Request 2 → Rank B (cùng prefix, đọc từ Rank A)
 
 ```
-Rank B: match_prefix() → L1 MISS, L2 local MISS
-      → prefetch_from_storage() → batch_exists()
-          → index lookup: dp_rank=A ≠ self.dp_rank=B → HIT
-      → _page_get_zero_copy() → batch_get_v1()
-          Phase 1 (LOCK_SH): peer_slot = entry.slot_idx  ← Rank A's slot pointer
-          Phase 2 (no lock):  memcpy(L2[own_slot], L2[peer_slot], page_bytes)
-      → GPU DMA: shared L2 own_slot → L1 GPU Rank B
+Rank B: match_prefix() → L1 MISS
+      → prefetch_from_storage() → batch_get_v1()
+          Phase 1 (LOCK_SH):
+            index lookup → dp_rank=A ≠ self.dp_rank=B → HIT
+            check gen counter: current == stored → data còn valid
+            peer_slot = entry.slot_start
+          Phase 2 (no lock):
+            memcpy(L2[own_slot], L2[peer_slot], page_bytes)
+      → GPU DMA: own_slot → L1 GPU Rank B
       → SKIP compute
 ```
 
-**Rank B chỉ tốn: 1 memcpy trong SHM + 1 DMA, không recompute prefix.**
+**Rank B chỉ tốn: 1 index lookup + 1 memcpy trong SHM + 1 DMA. Không recompute.**
+
+### Generation counter — tránh đọc stale data
+
+Mỗi lần Rank A cấp phát lại một slot (evict page cũ), counter của slot đó tăng lên 1. Rank B so sánh counter hiện tại với giá trị lưu trong index entry; nếu khác nhau → Rank A đã overwrite slot đó → bỏ qua, coi như miss thay vì copy data sai.
 
 ---
 
@@ -183,54 +205,82 @@ Truyền qua `--hicache-storage-backend-extra-config` dưới dạng JSON:
 
 | Key | Default | Mô tả |
 |---|---|---|
-| `peer_l2_capacity` | `4096` | Số entry trong index hash table. Nên đặt theo công thức trên |
-| `peer_l2_shm_dir` | `/dev/shm` | Thư mục chứa index SHM file |
+| `peer_l2_capacity` | auto (`page_num × 4`) | Số entry trong index hash table |
+| `peer_l2_shm_dir` | `/dev/shm` | Thư mục chứa index và gen array files |
+
+---
+
+## Docker / container
+
+Khi chạy trong container, cần mount `/dev/shm` với kích thước đủ lớn:
+
+```yaml
+# docker-compose.yaml
+services:
+  sglang:
+    shm_size: "500gb"          # phải >= L2_buffer + vài chục MB overhead
+    volumes:
+      - /dev/shm:/dev/shm      # share /dev/shm giữa các container cùng node
+```
+
+Hoặc khi dùng `docker run`:
 
 ```bash
---hicache-storage-backend-extra-config '{"peer_l2_capacity": 262144, "peer_l2_shm_dir": "/dev/shm"}'
+docker run --shm-size=500g -v /dev/shm:/dev/shm ...
 ```
+
+Tất cả container chạy DP rank trên cùng node phải dùng chung `/dev/shm` của host (mount `-v /dev/shm:/dev/shm`).
 
 ---
 
 ## Những điểm cần chú ý
 
 **1. `write_through` bắt buộc**
-`write_back` chỉ flush L2 khi evict khỏi L1 → Rank B không thấy data cho đến khi eviction xảy ra. Dùng `write_through` để L2 được populate ngay sau khi compute.
+`write_back` chỉ flush L2 khi evict khỏi L1. Rank B sẽ không thấy data cho đến khi eviction xảy ra — có thể hàng phút sau. Luôn dùng `write_through` với `shm_peer_l2`.
 
-**2. `peer_l2_capacity` quá nhỏ**
-Index là direct-mapped: khi collision, entry cũ bị overwrite. Data vẫn còn trong L2 SHM nhưng không tìm được qua index → miss. Không có warning log; chỉ thấy hit rate thấp bất thường.
+**2. Rank B phải đợi Rank A flush xong**
+Nếu Rank A chưa chạy xong `backup_thread`, Rank B sẽ miss index và phải compute lại. Đây là behavior đúng — không phải bug. Với `write_through`, khoảng trễ này rất nhỏ.
 
-**3. Rank B phải đợi Rank A flush xong**
-Nếu Rank A chưa chạy xong `backup_thread`, Rank B sẽ miss index và phải compute lại. Đây là behavior đúng — không phải bug.
+**3. Stale file sau khi restart**
+Các file SHM tồn tại sau khi stop server. SGLang tự detect stale (kiểm tra magic, capacity, file size) và recreate khi khởi động lại. Không cần xóa thủ công, nhưng nếu muốn giải phóng `/dev/shm` ngay:
+
+```bash
+rm -f /dev/shm/sglang_l2*
+```
 
 **4. `exists()` chỉ return True khi `dp_rank != self.dp_rank`**
-Mỗi rank tự đọc L2 local của mình qua L1/L2 path thông thường. Index chỉ dùng để tìm data của rank khác.
+Mỗi rank tự quản lý L2 local của mình qua cache controller thông thường. Index chỉ dùng để tìm data của rank **khác**.
 
-**5. Stale file sau khi restart**
-Các file SHM tồn tại sau khi stop server. SGLang tự detect stale (kiểm tra kích thước không khớp) và recreate ở lần khởi động tiếp theo. Không cần xóa thủ công trừ khi muốn giải phóng `/dev/shm`.
+**5. Chỉ hoạt động trong cùng node**
+`/dev/shm` là tmpfs node-local. Nếu DP rank nằm trên node khác nhau, dùng `mooncake` hoặc `nixl`.
 
-**6. Chỉ hoạt động trên cùng node**
-`/dev/shm` là tmpfs node-local. Nếu các DP rank nằm trên node khác nhau, dùng `mooncake` hoặc `nixl` thay thế.
+**6. Không dùng `shm_cross_dp` kèm `shm_peer_l2`**
+`shm_peer_l2` đã tự thiết lập shared L2 allocator (`shm_shared_l2`). Chỉ cần một flag `--hicache-storage-backend shm_peer_l2`.
 
 ---
 
 ## Verify hoạt động
 
 ```bash
-# 1. Kiểm tra SHM file dùng chung
-ls -lh /dev/shm/sglang_l2_*
-# Kỳ vọng: 1 file .mmap lớn (~L2 size) + 1 file index .bin nhỏ (~vài chục MB)
+# 1. Kiểm tra SHM files sau startup
+ls -lh /dev/shm/sglang_l2*
+# Kỳ vọng: 1 file .mmap lớn (~L2 size) + 4 file nhỏ (.bin, .bin.lock × 2)
 
-# 2. Kiểm tra dung lượng
-df -h /dev/shm
-
-# 3. Prometheus metrics — cross-rank hit xuất hiện khi Rank B đọc được của Rank A
-# hicache_host_used_tokens tăng nhanh hơn nếu sharing hoạt động
-
-# 4. Log tại startup (cả 2 rank phải thấy cùng 1 SHM file)
+# 2. Log startup — cả 2 rank phải báo cùng 1 index file
 grep "HiCacheShmPeerL2" /path/to/sglang.log
-# Rank 0: "created index ... capacity=262144"
-# Rank 1: "attached to existing index ..."
+# Rank 0: "HiCacheShmPeerL2: created index /dev/shm/sglang_l2_idx_... capacity=262144"
+# Rank 1: "HiCacheShmPeerL2: attached to existing index /dev/shm/sglang_l2_idx_..."
+
+# 3. Auto-computed capacity log (nếu không truyền peer_l2_capacity)
+grep "auto-computed peer_l2_capacity" /path/to/sglang.log
+# HiCacheShmPeerL2: auto-computed peer_l2_capacity=190732 (page_num=47683 × 4, index size=54.8 MB)
+
+# 4. Collision rate log (mỗi 10,000 writes)
+grep "collision rate" /path/to/sglang.log
+# Warning nếu > 10%: tăng peer_l2_capacity
+
+# 5. Kiểm tra dung lượng
+df -h /dev/shm
 ```
 
 ---
@@ -238,7 +288,7 @@ grep "HiCacheShmPeerL2" /path/to/sglang.log
 ## Tham khảo
 
 - Implementation: `hicache_shm_peer_l2.py` (cùng thư mục)
-- Allocator: `pool_host/common.py` — `ShmHostTensorAllocator`, `get_allocator_type()`
-- L2 pool base: `pool_host/base.py` — slot partitioning, `local_size`, `free_slots`
-- Cache controller: `managers/cache_controller.py` — `_page_set_zero_copy`, `_page_get_zero_copy`, `backup_thread_func`
-- Radix cache: `mem_cache/hiradix_cache.py` — `write_backup`, `_inc_hit_count`, `prefetch_from_storage`
+- Shared allocator: `pool_host/common.py` — `ShmHostTensorAllocator`, `get_allocator_type()`
+- SHM file allocation: `storage/mmap/mmap_allocator.py` — `alloc_shm`, `_open_named_shm_fd`
+- L2 pool base: `pool_host/base.py` — slot partitioning, `dp_rank`, `dp_size`, `local_size`, `register_alloc_callback`
+- Cache controller: `hiradix_cache.py` — `write_backup`, `_inc_hit_count`, `prefetch_from_storage`
