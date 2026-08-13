@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
 
 logger = logging.getLogger(__name__)
 
@@ -161,28 +162,34 @@ class HiCacheShmPeerL2(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host):
         super().register_mem_pool_host(mem_pool_host)
-        self._page_size = mem_pool_host.page_size
-        self._dp_rank = mem_pool_host.dp_rank
-        self._dp_size = mem_pool_host.dp_size
+        # HostPoolGroup wraps HostKVCache entries; dp_rank/dp_size/page_num and
+        # register_alloc_callback live on the underlying HostKVCache, not the group.
+        if isinstance(mem_pool_host, HostPoolGroup):
+            host_pool = mem_pool_host.anchor_entry.host_pool
+        else:
+            host_pool = mem_pool_host
+        self._page_size = host_pool.page_size
+        self._dp_rank = host_pool.dp_rank
+        self._dp_size = host_pool.dp_size
         if not self._capacity_user_set:
             # Auto-compute: all DP ranks write to the same index, so total
             # active keys ≈ page_num (both partitions combined). ×4 gives a
             # 25% load factor on the direct-mapped table, keeping collision
             # rate low without burning too much /dev/shm.
-            self._capacity = mem_pool_host.page_num * 4
+            self._capacity = host_pool.page_num * 4
             logger.info(
                 "HiCacheShmPeerL2: auto-computed peer_l2_capacity=%d "
                 "(page_num=%d × 4, index size=%.1f MB); "
                 "override with peer_l2_capacity in --hicache-storage-backend-extra-config",
                 self._capacity,
-                mem_pool_host.page_num,
+                host_pool.page_num,
                 self._capacity * _ENTRY_SIZE / 1024**2,
             )
         if self._mm is None:
             self._init_shm()
         if self._gen_mm is None:
-            self._init_gen_shm(mem_pool_host.page_num)
-        mem_pool_host.register_alloc_callback(self._alloc_callback)
+            self._init_gen_shm(host_pool.page_num)
+        host_pool.register_alloc_callback(self._alloc_callback)
 
     def _init_shm(self) -> None:
         total_bytes = _HEADER_SIZE + self._capacity * _ENTRY_SIZE

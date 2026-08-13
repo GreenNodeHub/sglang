@@ -1694,6 +1694,9 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
+        # Slot addressing mirrors the anchor pool (HostKVCache.clear() needs these).
+        self.local_size = anchor_host.local_size
+        self.slot_start = anchor_host.slot_start
 
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize

@@ -72,7 +72,7 @@ def can_use_hicache_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
+    if element_size % 16 != 0:
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
@@ -114,14 +114,21 @@ def can_use_write_back_jit_kernel(
 
 
 def _default_unroll(element_size: int) -> int:
+    # Prefer higher unroll (more threads per element) for bandwidth; fall back
+    # to a lower-parallelism value when kBytes doesn't divide evenly.
+    kWarpThreads = 32
     if element_size <= 512:
-        return 4
-
-    if element_size <= 1024:
-        return 2
-
-    # fallback: no unroll
-    return 1
+        preferred = [4, 2, 1, 8, 16, 32]
+    elif element_size <= 1024:
+        preferred = [2, 4, 1, 8, 16, 32]
+    else:
+        preferred = [1, 2, 4, 8, 16, 32]
+    for unroll in preferred:
+        num_threads = kWarpThreads // unroll
+        bytes_per_thread = element_size // num_threads
+        if element_size % num_threads == 0 and bytes_per_thread % 4 == 0:
+            return unroll
+    raise ValueError(f"No valid unroll factor for element_size={element_size}")
 
 
 @debug_kernel_api
