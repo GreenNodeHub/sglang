@@ -264,6 +264,21 @@ pub(crate) fn init_metrics() {
         "Observed max_load - min_load at cache_aware decision time. Compare with \
          balance_abs_threshold to see how close the imbalance fallback is to firing"
     );
+    // --- tool-call argument canonicalisation (local addition) ---
+    describe_counter!(
+        "smg_toolcall_args_requests_total",
+        "Chat requests by whether any historical tool call's arguments had to be \
+         re-serialised for prefix-cache stability: churned=true means the client \
+         sent a different key order than the canonical one. The true/false split \
+         is the per-request churn rate"
+    );
+    describe_counter!(
+        "smg_toolcall_args_canonicalized_total",
+        "Individual tool calls whose arguments key order was rewritten. Counts \
+         calls, not requests, so it shows how deep into the history the churn \
+         reaches - the earliest rewritten call is where the engine's radix prefix \
+         cache gets capped"
+    );
     describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
@@ -996,6 +1011,24 @@ impl Metrics {
     /// fallback is to firing.
     pub fn set_cache_aware_load_spread(spread: usize) {
         gauge!("smg_cache_aware_load_spread").set(spread as f64);
+    }
+
+    /// Record the outcome of tool-call argument canonicalisation for one request.
+    ///
+    /// `rewritten` is how many tool calls in the history had a non-canonical key
+    /// order. Zero means the client is already byte-stable across turns, so the
+    /// true/false split on `smg_toolcall_args_requests_total` tells you whether
+    /// the churn still exists upstream -- which the engine's prompt dumps no
+    /// longer can once this fix is in the path.
+    pub fn record_toolcall_args_canonicalized(rewritten: usize) {
+        counter!(
+            "smg_toolcall_args_requests_total",
+            "churned" => if rewritten > 0 { "true" } else { "false" }
+        )
+        .increment(1);
+        if rewritten > 0 {
+            counter!("smg_toolcall_args_canonicalized_total").increment(rewritten as u64);
+        }
     }
 
     /// Record which worker was actually selected, by URL.

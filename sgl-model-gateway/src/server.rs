@@ -40,7 +40,7 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
+        chat::{ChatCompletionRequest, ChatMessage},
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -181,15 +181,168 @@ async fn generate(
         .await
 }
 
+/// Local addition: canonicalise the key order inside every historical tool call's
+/// `function.arguments` before routing. Sibling of the tool JSON-Schema fix in
+/// `routers/http/router.rs:529`, but aimed at the *message history* instead of the
+/// tool list at the head of the prompt.
+///
+/// `arguments` is typed `Option<String>` (openai-protocol `common.rs:416`) -- an
+/// opaque JSON string serde never looks inside -- and this crate builds serde_json
+/// with "preserve_order", so whatever key order the client sends survives
+/// byte-for-byte through the router and into the chat template. GLM emits one
+/// <arg_key> per key in iteration order, and SGLang preserves that order too
+/// (`serving_chat.py:106` parses with `orjson.loads`, no sort anywhere in
+/// `entrypoints/openai/`). So a client that re-serialises its tool inputs with a
+/// different key order between turns rewrites history mid-prompt, and the engine's
+/// radix prefix cache is capped at the first reordered call: measured 71424 of
+/// 145254 prompt tokens retained (~74k tokens of cold prefill per turn) on a
+/// Claude Code session whose Bash/Read/Edit calls came back shuffled every turn.
+///
+/// `sort_all_objects()` recurses into nested objects and into array *elements*
+/// while leaving array order alone, so a nested payload is covered but a
+/// semantically ordered list is not disturbed.
+///
+/// Returns how many tool calls actually changed, which separates a well-behaved
+/// client from a churning one.
+fn canonicalize_tool_call_arguments(req: &mut ChatCompletionRequest) -> usize {
+    let mut rewritten = 0;
+    for msg in req.messages.iter_mut() {
+        let ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = msg
+        else {
+            continue;
+        };
+        for call in calls.iter_mut() {
+            let Some(args) = call.function.arguments.as_mut() else {
+                continue;
+            };
+            // Leave malformed JSON untouched: the engine rejects it with its own
+            // error and masking that here would only make it harder to diagnose.
+            let Ok(mut parsed) = serde_json::from_str::<Value>(args) else {
+                continue;
+            };
+            parsed.sort_all_objects();
+            let Ok(canonical) = serde_json::to_string(&parsed) else {
+                continue;
+            };
+            if canonical != *args {
+                *args = canonical;
+                rewritten += 1;
+            }
+        }
+    }
+    rewritten
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(mut body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    let rewritten = canonicalize_tool_call_arguments(&mut body);
+    metrics::Metrics::record_toolcall_args_canonicalized(rewritten);
+    if rewritten > 0 {
+        debug!(
+            "canonicalised {} tool call argument object(s) for prefix-cache stability",
+            rewritten
+        );
+    }
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
         .await
+}
+
+#[cfg(test)]
+mod tool_call_args_canon_tests {
+    use super::*;
+
+    fn req_with_args(args: &str) -> ChatCompletionRequest {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Bash", "arguments": args}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        });
+        serde_json::from_value(body).expect("request should deserialize")
+    }
+
+    fn args_of(req: &ChatCompletionRequest) -> String {
+        for msg in &req.messages {
+            if let ChatMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = msg
+            {
+                return calls[0].function.arguments.clone().expect("arguments present");
+            }
+        }
+        panic!("no assistant tool call in request");
+    }
+
+    /// The two key orderings actually observed on consecutive turns of one
+    /// Claude Code session must collapse to the same bytes.
+    #[test]
+    fn shuffled_key_order_converges() {
+        let sorted = r#"{"command":"ls","description":"list","timeout":120000}"#;
+        let shuffled = r#"{"description":"list","command":"ls","timeout":120000}"#;
+
+        let mut a = req_with_args(sorted);
+        let mut b = req_with_args(shuffled);
+
+        // Already canonical -> untouched, so a churning client is distinguishable.
+        assert_eq!(canonicalize_tool_call_arguments(&mut a), 0);
+        assert_eq!(canonicalize_tool_call_arguments(&mut b), 1);
+
+        assert_eq!(args_of(&a), args_of(&b));
+        assert_eq!(args_of(&b), sorted);
+    }
+
+    /// The AskUserQuestion shape: objects nested inside an array also reordered
+    /// across turns, so the fix has to recurse through array elements.
+    #[test]
+    fn nested_objects_inside_arrays_are_sorted() {
+        let mut a = req_with_args(
+            r#"{"questions":[{"header":"h","options":[{"label":"l","description":"d"}],"multiSelect":false,"question":"q"}]}"#,
+        );
+        let mut b = req_with_args(
+            r#"{"questions":[{"options":[{"description":"d","label":"l"}],"header":"h","question":"q","multiSelect":false}]}"#,
+        );
+        canonicalize_tool_call_arguments(&mut a);
+        canonicalize_tool_call_arguments(&mut b);
+        assert_eq!(args_of(&a), args_of(&b));
+        assert_eq!(
+            args_of(&a),
+            r#"{"questions":[{"header":"h","multiSelect":false,"options":[{"description":"d","label":"l"}],"question":"q"}]}"#
+        );
+    }
+
+    /// Array order is semantic (`required`, `enum`, an ordered option list), so
+    /// elements must keep their positions.
+    #[test]
+    fn array_element_order_is_preserved() {
+        let mut r = req_with_args(r#"{"required":["z","a","m"],"n":1}"#);
+        canonicalize_tool_call_arguments(&mut r);
+        assert_eq!(args_of(&r), r#"{"n":1,"required":["z","a","m"]}"#);
+    }
+
+    /// Malformed arguments must reach the engine unchanged so its own error
+    /// surfaces instead of a router-side rewrite masking it.
+    #[test]
+    fn malformed_arguments_are_left_alone() {
+        let broken = r#"{"command":"ls",,}"#;
+        let mut r = req_with_args(broken);
+        assert_eq!(canonicalize_tool_call_arguments(&mut r), 0);
+        assert_eq!(args_of(&r), broken);
+    }
 }
 
 async fn v1_completions(
