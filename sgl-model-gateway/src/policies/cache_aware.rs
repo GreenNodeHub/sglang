@@ -72,6 +72,47 @@ use super::{
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
+use crate::observability::metrics::Metrics;
+
+/// Which decision path `select_worker` took.
+///
+/// Mirrors the `Branch` pattern already used by prefix_hash / consistent_hashing /
+/// manual. Upstream leaves cache_aware uninstrumented despite it being the default
+/// policy and the only one with a two-mode decision tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Branch {
+    /// System imbalanced -> shortest queue, cache affinity ignored
+    ImbalancedShortestQueue,
+    /// Balanced, match rate above cache_threshold -> routed to the cached worker
+    BalancedCacheHit,
+    /// Balanced, match rate at or below cache_threshold -> shortest queue
+    BalancedLowMatchMinLoad,
+    /// Best-match worker vanished or went unhealthy -> first healthy worker
+    StaleTenantFallback,
+    /// No tree seeded for this pool -> random worker, affinity disabled
+    NoTreeRandom,
+    /// Nothing healthy to route to
+    NoHealthyWorkers,
+}
+
+impl Branch {
+    #[inline]
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ImbalancedShortestQueue => "imbalanced_shortest_queue",
+            Self::BalancedCacheHit => "balanced_cache_hit",
+            Self::BalancedLowMatchMinLoad => "balanced_low_match_min_load",
+            Self::StaleTenantFallback => "stale_tenant_fallback",
+            Self::NoTreeRandom => "no_tree_random",
+            Self::NoHealthyWorkers => "no_healthy_workers",
+        }
+    }
+
+    #[inline]
+    fn record(self) {
+        Metrics::record_worker_cache_aware_policy_branch(self.as_str());
+    }
+}
 
 /// Tag used to isolate prefill/decode/regular worker pools in the cache_aware tree key.
 ///
@@ -107,12 +148,28 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
 /// regular worker pools cannot evict each other's tenants.
 /// Supports mesh synchronization of tree operations across cluster nodes.
 /// When mesh is not enabled, the policy works independently without synchronization.
+/// Exclude a worker once its KV pool is this full, in permille.
+///
+/// 950 = 95%, not 1000. At a literal 100% the worker is already wedged; the
+/// point of the gate is to stop feeding it slightly before that.
+const SATURATION_EXCLUDE_PERMILLE: u32 = 950;
+
+/// Workers must stay below this to be re-admitted, in permille. The gap from
+/// SATURATION_EXCLUDE_PERMILLE is hysteresis - without it a worker hovering at
+/// the threshold flaps in and out of the pool on every 30s refresh.
+const SATURATION_READMIT_PERMILLE: u32 = 850;
+
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
     mesh_sync: OptionalMeshSyncManager,
     _eviction_task: Option<PeriodicTask>,
+    /// Per-worker KV saturation in permille, refreshed by the load monitor.
+    /// Absent entry = unknown, which never excludes.
+    saturation: std::sync::RwLock<std::collections::HashMap<String, u32>>,
+    /// Workers currently excluded by the gate, for hysteresis.
+    excluded: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl CacheAwarePolicy {
@@ -153,7 +210,76 @@ impl CacheAwarePolicy {
             trees,
             mesh_sync: None,
             _eviction_task: eviction_task,
+            saturation: std::sync::RwLock::new(std::collections::HashMap::new()),
+            excluded: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Drop saturated workers from the candidate set.
+    ///
+    /// Rules, in order of importance:
+    ///   1. NEVER return empty. If every worker is saturated there is nowhere
+    ///      better to send the request, and excluding all of them would turn a
+    ///      slow pool into a 503 outage. Fall back to the full set.
+    ///   2. Unknown saturation never excludes. A parse failure or a worker that
+    ///      has not been polled yet must not be ejected.
+    ///   3. Hysteresis: exclude above SATURATION_EXCLUDE_PERMILLE, re-admit only
+    ///      below SATURATION_READMIT_PERMILLE, so a worker sitting near the line
+    ///      does not flap on every refresh.
+    fn filter_saturated(&self, workers: &[Arc<dyn Worker>], healthy: Vec<usize>) -> Vec<usize> {
+        let sat = match self.saturation.read() {
+            Ok(g) => g,
+            Err(_) => return healthy,
+        };
+        if sat.is_empty() {
+            return healthy;
+        }
+
+        let mut excluded = match self.excluded.write() {
+            Ok(g) => g,
+            Err(_) => return healthy,
+        };
+
+        let mut keep = Vec::with_capacity(healthy.len());
+        for idx in healthy.iter().copied() {
+            let url = workers[idx].url();
+            let was_excluded = excluded.contains(url);
+            let drop_it = match sat.get(url) {
+                None => false, // rule 2: unknown is not saturated
+                Some(&p) => {
+                    if was_excluded {
+                        p >= SATURATION_READMIT_PERMILLE
+                    } else {
+                        p >= SATURATION_EXCLUDE_PERMILLE
+                    }
+                }
+            };
+
+            if drop_it {
+                if !was_excluded {
+                    excluded.insert(url.to_string());
+                    warn!(
+                        "cache_aware: excluding saturated worker {} ({}permille KV)",
+                        url,
+                        sat.get(url).copied().unwrap_or(0)
+                    );
+                }
+                Metrics::record_worker_cache_aware_policy_branch("saturation_excluded");
+            } else {
+                if was_excluded {
+                    excluded.remove(url);
+                    debug!("cache_aware: re-admitting worker {}", url);
+                }
+                keep.push(idx);
+            }
+        }
+
+        // Rule 1: everyone saturated -> gate is useless, route normally.
+        if keep.is_empty() {
+            Metrics::record_worker_cache_aware_policy_branch("saturation_all_excluded_bypass");
+            return healthy;
+        }
+        keep
     }
 
     /// Set mesh sync manager (can be called after construction)
@@ -382,8 +508,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
+            Branch::NoHealthyWorkers.record();
             return None;
         }
+
+        // Local addition: drop workers whose KV pool is effectively full before
+        // any routing decision is made. Never returns empty - see filter_saturated.
+        let healthy_indices = self.filter_saturated(workers, healthy_indices);
 
         // Determine the (pool, model) key for this set of workers — the router pre-filters
         // so every healthy worker here belongs to the same pool and same model.
@@ -401,7 +532,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
+        // Observability: how close is the imbalance fallback to firing?
+        Metrics::set_cache_aware_load_spread(max_load.saturating_sub(min_load));
+
         if is_imbalanced {
+            Branch::ImbalancedShortestQueue.record();
+            // No tree lookup happens on this path, so there is no match rate to
+            // report. Count it anyway so the hit-rate denominator stays honest.
+            Metrics::record_cache_aware_hit("not_evaluated");
             return self.select_worker_min_load(
                 workers,
                 &request_text,
@@ -428,6 +566,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
+
+            // Observability: the match rate that drives the decision below.
+            Metrics::record_cache_aware_match_rate(match_rate as f64);
+            if match_rate > self.config.cache_threshold {
+                Branch::BalancedCacheHit.record();
+                Metrics::record_cache_aware_hit("hit");
+            } else {
+                Branch::BalancedLowMatchMinLoad.record();
+                Metrics::record_cache_aware_hit("miss");
+            }
 
             // Select worker without String allocation
             let selected_idx = if match_rate > self.config.cache_threshold {
@@ -487,6 +635,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 }
             }
 
+            Branch::StaleTenantFallback.record();
+
             // Fallback to first healthy worker
             healthy_indices.first().copied()
         } else {
@@ -498,6 +648,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                  clears",
                 tree_key
             );
+            Branch::NoTreeRandom.record();
+            Metrics::record_cache_aware_hit("not_evaluated");
+
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
             Some(healthy_indices[random_idx])
@@ -513,6 +666,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 worker_url,
                 success
             );
+        }
+    }
+
+    /// Local addition: receive per-worker KV saturation from the load monitor.
+    fn update_saturation(&self, saturation: &std::collections::HashMap<String, u32>) {
+        if let Ok(mut g) = self.saturation.write() {
+            *g = saturation.clone();
         }
     }
 

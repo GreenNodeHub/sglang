@@ -204,12 +204,34 @@ impl WorkerManager {
         }
     }
 
+    /// Split a worker URL into its addressable base and optional DP rank.
+    ///
+    /// Under `--dp-aware` the registry stores one worker per DP rank as
+    /// `http://host:port@N`. That string is NOT a fetchable URL - `@` is the
+    /// userinfo delimiter, so `http://127.0.0.1:8001@0/v1/loads` resolves to
+    /// host `0` and the request fails ("Failed to connect to 0.0.0.0 port 80").
+    ///
+    /// Upstream builds its load-fetch URL straight from `worker.url()`, so every
+    /// token-load fetch fails under --dp-aware and every worker reports -1.
+    ///
+    /// Returns `(base_url, Some(rank))` for a rank worker, `(url, None)` otherwise.
+    fn split_worker_url(url: &str) -> (&str, Option<u32>) {
+        match url.rsplit_once('@') {
+            Some((base, rank)) => match rank.parse::<u32>() {
+                Ok(r) => (base, Some(r)),
+                Err(_) => (url, None), // an '@' that is not a rank suffix
+            },
+            None => (url, None),
+        }
+    }
+
     async fn parse_load_response(
         client: &reqwest::Client,
         url: &str,
         api_key: Option<&str>,
     ) -> isize {
-        let load_url = format!("{}/v1/loads?include=core", url);
+        let (base, rank) = Self::split_worker_url(url);
+        let load_url = format!("{}/v1/loads?include=core", base);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
@@ -217,16 +239,154 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
+                Ok(json) => Self::extract_total_tokens(&json, rank),
                 _ => -1,
             },
             _ => -1,
         }
+    }
+
+    /// Pull a token-level load figure out of a /v1/loads response.
+    ///
+    /// Upstream reads `json["aggregate"]["total_tokens"]`, but no SGLang engine
+    /// emits an `aggregate` key - v0.5.15 and current main both return:
+    ///
+    /// ```json
+    /// { "timestamp": ..., "version": "0.5.15",
+    ///   "loads": [ { "dp_rank": 0, "num_used_tokens": 0,
+    ///                "num_waiting_uncached_tokens": 0, ... } ] }
+    /// ```
+    ///
+    /// So the upstream lookup always misses and every worker reports -1, which
+    /// silently degrades power_of_two to request counts. This reads the schema
+    /// the engine actually produces, summing across DP ranks, and keeps the
+    /// `aggregate` path first so a future engine that does emit it still wins.
+    ///
+    /// Per-worker KV saturation in permille (0-1000), from the same payload.
+    ///
+    /// `extract_total_tokens` gives an absolute token count, which cannot answer
+    /// "is this worker full?" on its own. `/v1/loads` also reports
+    /// `max_total_num_tokens`, so the ratio is computable without extra calls.
+    /// Returns None when capacity is unknown - callers must treat that as
+    /// "unknown", never as "saturated", or a parse failure would eject the pool.
+    /// `rank = Some(n)` scopes the reading to that DP rank; `None` aggregates.
+    ///
+    /// Scoping matters: each DP rank owns a SEPARATE KV pool and queue, so a
+    /// pool-wide average hides the case this gate exists for. Rank 0 at 100% and
+    /// rank 1 at 0% averages to a healthy-looking 500 permille while half the
+    /// server is wedged.
+    fn extract_saturation_permille(json: &Value, rank: Option<u32>) -> Option<u32> {
+        let loads = json.get("loads")?.as_array()?;
+        if loads.is_empty() {
+            return None;
+        }
+
+        let selected: Vec<&Value> = match rank {
+            Some(r) => loads
+                .iter()
+                .filter(|e| e.get("dp_rank").and_then(|v| v.as_u64()) == Some(r as u64))
+                .collect(),
+            None => loads.iter().collect(),
+        };
+        // A rank that vanished from the payload is unknown, not saturated.
+        if selected.is_empty() {
+            return None;
+        }
+
+        let mut used: i64 = 0;
+        let mut cap: i64 = 0;
+        for entry in selected {
+            for key in ["num_used_tokens", "num_waiting_uncached_tokens"] {
+                used += entry.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+            }
+            cap += entry
+                .get("max_total_num_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+        }
+        if cap <= 0 {
+            return None;
+        }
+        // Saturate rather than wrap: queued tokens can exceed capacity.
+        Some(((used.max(0) as i128 * 1000 / cap as i128).min(u32::MAX as i128)) as u32)
+    }
+
+    /// Fetch saturation for every worker. Workers whose value cannot be
+    /// determined are omitted, so consumers see absence rather than a wrong 0.
+    pub async fn get_all_worker_saturation(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> HashMap<String, u32> {
+        let mut out = HashMap::new();
+        // Cache responses by base URL: under --dp-aware every rank of a server
+        // shares one endpoint, so N ranks would otherwise mean N identical GETs.
+        let mut fetched: HashMap<String, Option<Value>> = HashMap::new();
+
+        for worker in worker_registry.get_all() {
+            let (base, rank) = Self::split_worker_url(worker.url());
+
+            if !fetched.contains_key(base) {
+                let url = format!("{}/v1/loads?include=core", base);
+                let body = match client.get(&url).timeout(REQUEST_TIMEOUT).send().await {
+                    Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+                    _ => None,
+                };
+                fetched.insert(base.to_string(), body);
+            }
+
+            if let Some(Some(json)) = fetched.get(base) {
+                if let Some(p) = Self::extract_saturation_permille(json, rank) {
+                    // Key by the FULL worker url (with @rank) so the policy can
+                    // match it against worker.url() when filtering candidates.
+                    out.insert(worker.url().to_string(), p);
+                }
+            }
+        }
+        out
+    }
+
+    /// Load = tokens already resident + tokens queued but not yet cached, which
+    /// is the quantity that predicts KV pressure.
+    fn extract_total_tokens(json: &Value, rank: Option<u32>) -> isize {
+        // Preferred shape, if any engine ever emits it. Note this is inherently
+        // server-wide, so it is only used when no rank was requested.
+        if rank.is_none() {
+            if let Some(n) = json
+                .get("aggregate")
+                .and_then(|a| a.get("total_tokens"))
+                .and_then(|v| v.as_i64())
+            {
+                return n as isize;
+            }
+        }
+
+        // Actual shape: per-DP-rank entries. Scope to one rank when asked,
+        // otherwise sum the server.
+        if let Some(loads) = json.get("loads").and_then(|v| v.as_array()) {
+            if loads.is_empty() {
+                return -1;
+            }
+            let mut total: i64 = 0;
+            let mut saw_field = false;
+            for entry in loads {
+                if let Some(r) = rank {
+                    if entry.get("dp_rank").and_then(|v| v.as_u64()) != Some(r as u64) {
+                        continue;
+                    }
+                }
+                for key in ["num_used_tokens", "num_waiting_uncached_tokens"] {
+                    if let Some(v) = entry.get(key).and_then(|v| v.as_i64()) {
+                        total += v;
+                        saw_field = true;
+                    }
+                }
+            }
+            if saw_field {
+                return total as isize;
+            }
+        }
+
+        -1
     }
 
     pub async fn get_engine_metrics(
@@ -348,9 +508,14 @@ impl LoadMonitor {
             interval_timer.tick().await;
 
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
+            // Local addition: cache_aware also consumes load data now (for its
+            // saturation gate), so the monitor must run when EITHER is active.
+            // Upstream skipped the fetch entirely unless a power_of_two policy
+            // existed, which silently starved any other load-aware policy.
+            let cache_aware_policies = policy_registry.get_all_cache_aware_policies();
 
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
+            if power_of_two_policies.is_empty() && cache_aware_policies.is_empty() {
+                debug!("No load-aware policies found, skipping load fetch");
                 continue;
             }
 
@@ -371,6 +536,22 @@ impl LoadMonitor {
                     policy.update_loads(&loads);
                 }
                 let _ = tx.send(loads);
+            }
+
+            // Local addition: feed cache_aware its saturation view.
+            if !cache_aware_policies.is_empty() {
+                let saturation =
+                    WorkerManager::get_all_worker_saturation(&worker_registry, &client).await;
+                if !saturation.is_empty() {
+                    debug!(
+                        "Fetched saturation for {} workers, updating {} cache_aware policies",
+                        saturation.len(),
+                        cache_aware_policies.len()
+                    );
+                    for policy in &cache_aware_policies {
+                        policy.update_saturation(&saturation);
+                    }
+                }
             } else {
                 warn!("No loads fetched from workers");
             }

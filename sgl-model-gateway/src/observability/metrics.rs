@@ -237,6 +237,33 @@ pub(crate) fn init_metrics() {
         "smg_worker_selection_total",
         "Worker selection events by worker_type, connection_mode, model, policy"
     );
+    // --- cache_aware observability (local addition) ---
+    describe_counter!(
+        "smg_worker_selected_total",
+        "Worker selection events by worker URL and policy - gives the routing split, \
+         which smg_worker_selection_total cannot (it has no per-worker label)"
+    );
+    describe_counter!(
+        "smg_cache_aware_policy_branch_total",
+        "cache_aware routing decisions by branch: imbalanced_shortest_queue, \
+         balanced_cache_hit, balanced_low_match_min_load, stale_tenant_fallback, \
+         no_tree_random, no_healthy_workers"
+    );
+    describe_histogram!(
+        "smg_cache_aware_match_rate",
+        "Prefix match rate (0.0-1.0) driving each cache_aware decision. \
+         CHARACTER match ratio, not tokens. Bucketed 0..1 so it aggregates"
+    );
+    describe_counter!(
+        "smg_cache_aware_hit_total",
+        "cache_aware affinity outcome by result: hit (above cache_threshold), \
+         miss (evaluated, below threshold), not_evaluated (no tree lookup done)"
+    );
+    describe_gauge!(
+        "smg_cache_aware_load_spread",
+        "Observed max_load - min_load at cache_aware decision time. Compare with \
+         balance_abs_threshold to see how close the imbalance fallback is to firing"
+    );
     describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
@@ -351,11 +378,25 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
+    // Local addition: give the cache-match ratio real histogram buckets.
+    // Without this, metrics-rs renders every histogram! as a Prometheus SUMMARY -
+    // preset quantiles only, and summaries cannot be aggregated across router
+    // instances. A 0..1 ratio also needs its own scale; the duration buckets
+    // above are useless for it. Buckets are dense near 0 and near 1 because the
+    // observed distribution is bimodal (measured: 17% under 0.3, 82% over 0.99,
+    // nothing in between).
+    let ratio_matcher = Matcher::Full(String::from("smg_cache_aware_match_rate"));
+    let ratio_buckets: Vec<f64> = vec![
+        0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0,
+    ];
+
     PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(ratio_matcher, &ratio_buckets)
+        .expect("failed to set cache-match ratio buckets")
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }
@@ -905,6 +946,68 @@ impl Metrics {
         counter!(
             "smg_prefix_hash_policy_branch_total",
             "branch" => branch
+        )
+        .increment(1);
+    }
+
+    // ------------------------------------------------------------------
+    // cache_aware observability (local addition)
+    //
+    // Upstream instruments manual / consistent_hashing / prefix_hash with a
+    // branch counter but leaves cache_aware — the DEFAULT policy and the only
+    // one with a two-mode decision tree — completely uninstrumented. These
+    // follow the same convention.
+    // ------------------------------------------------------------------
+
+    /// Record cache_aware policy execution branch for routing decisions
+    pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_cache_aware_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the prefix match rate (0.0-1.0) that drove a cache_aware decision.
+    /// Note this is a CHARACTER match ratio, not tokens.
+    pub fn record_cache_aware_match_rate(rate: f64) {
+        histogram!("smg_cache_aware_match_rate").record(rate);
+    }
+
+    /// Record the hit/miss outcome of a cache_aware decision.
+    ///
+    /// `result` is one of:
+    ///   "hit"           - match rate cleared cache_threshold, routed by affinity
+    ///   "miss"          - match evaluated but below threshold, routed by load
+    ///   "not_evaluated" - no match was computed at all (imbalanced fallback,
+    ///                     missing tree). Counted so the hit-rate denominator is
+    ///                     honest: without it, a policy that never consults the
+    ///                     tree would report a flattering 0/0.
+    pub fn record_cache_aware_hit(result: &'static str) {
+        counter!(
+            "smg_cache_aware_hit_total",
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record the observed load spread (max_load - min_load) seen by cache_aware.
+    /// Compare against balance_abs_threshold to see how close the imbalance
+    /// fallback is to firing.
+    pub fn set_cache_aware_load_spread(spread: usize) {
+        gauge!("smg_cache_aware_load_spread").set(spread as f64);
+    }
+
+    /// Record which worker was actually selected, by URL.
+    ///
+    /// `smg_worker_selection_total` is labelled by policy only and carries no
+    /// per-worker label, so it cannot show a routing split. This one can.
+    pub fn record_worker_selected(worker: &str, policy: &'static str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_selected_total",
+            "worker" => worker_interned,
+            "policy" => policy
         )
         .increment(1);
     }
