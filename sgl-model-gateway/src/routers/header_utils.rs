@@ -213,6 +213,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || name.eq_ignore_ascii_case("x-session-id")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -278,6 +279,9 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
+        assert!(should_forward_request_header("x-session-id"));
+        assert!(should_forward_request_header("X-Session-Id"));
+        assert!(should_forward_request_header("X-SESSION-ID"));
     }
 
     #[test]
@@ -295,5 +299,9 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+        // Near-misses of x-session-id: exact match only, no prefix/substring rule.
+        assert!(!should_forward_request_header("x-session-id-extra"));
+        assert!(!should_forward_request_header("x-session"));
+        assert!(!should_forward_request_header("session-id"));
     }
 }
