@@ -77,6 +77,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Update per-worker KV saturation, in permille (0-1000).
+    ///
+    /// Local addition. `update_loads` carries ABSOLUTE token counts, which cannot
+    /// answer "is this worker full?" without also knowing its capacity. This
+    /// carries the ratio (used+queued tokens / max_total_num_tokens x 1000) so a
+    /// policy can exclude saturated workers.
+    ///
+    /// Default no-op, mirroring `update_loads`.
+    fn update_saturation(&self, _saturation: &std::collections::HashMap<String, u32>) {
+        // Default: no-op for policies that don't use saturation information
+    }
+
     /// Set mesh sync manager
     fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
         // Default: no-op for policies that don't use mesh sync

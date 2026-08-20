@@ -188,6 +188,11 @@ impl Router {
             policy.name(),
         );
 
+        // Local addition: the same event labelled by worker URL, so the routing
+        // split is actually observable. smg_worker_selection_total carries no
+        // per-worker label and therefore cannot show which worker was chosen.
+        Metrics::record_worker_selected(available[idx].url(), policy.name());
+
         Some(available[idx].clone())
     }
 
@@ -520,6 +525,21 @@ impl Router {
                     );
                 }
             };
+
+            // Local addition: canonicalise tool JSON-Schema key order before
+            // forwarding. `Function.parameters` is a serde_json::Value and this
+            // crate builds serde_json with "preserve_order", so the client's key
+            // order survives untouched into the chat template -- where it lands at
+            // the head of the prompt (GLM chat_template.jinja:4, ahead of the
+            // message loop at :55) and is tokenised into the engine's radix-cache
+            // key. Two clients sending the same schema with different key order
+            // then share no prefix: measured 96 of 4523 tokens retained (97.9%
+            // lost) when the first tool differs, still 73.4% lost when only the
+            // last one does. sort_all_objects() recurses into nested objects and
+            // leaves arrays alone, so `required`/`enum` order is preserved.
+            if let Some(tools) = json_val.get_mut("tools") {
+                tools.sort_all_objects();
+            }
 
             if let Some(map) = json_val.as_object_mut() {
                 // Use static key string to avoid allocation

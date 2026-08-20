@@ -255,6 +255,36 @@ impl PolicyRegistry {
     }
 
     /// Get all PowerOfTwo policies that need load updates (lock-free)
+    /// Local addition: every registered cache_aware policy, so the load monitor
+    /// can feed them saturation data. Same traversal as the power_of_two getter
+    /// below (default, prefill, decode, per-model), deduplicated by Arc identity.
+    pub fn get_all_cache_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        self.get_all_policies_named("cache_aware")
+    }
+
+    /// Shared traversal used by the by-name getters.
+    fn get_all_policies_named(&self, want: &str) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut found: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
+        let push_unique = |p: &Arc<dyn LoadBalancingPolicy>,
+                           acc: &mut Vec<Arc<dyn LoadBalancingPolicy>>| {
+            if p.name() == want && !acc.iter().any(|e| Arc::ptr_eq(e, p)) {
+                acc.push(Arc::clone(p));
+            }
+        };
+
+        push_unique(&self.default_policy, &mut found);
+        if let Some(p) = self.prefill_policy.get() {
+            push_unique(p, &mut found);
+        }
+        if let Some(p) = self.decode_policy.get() {
+            push_unique(p, &mut found);
+        }
+        for entry in self.model_policies.iter() {
+            push_unique(entry.value(), &mut found);
+        }
+        found
+    }
+
     pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut power_of_two_policies = Vec::new();
 
